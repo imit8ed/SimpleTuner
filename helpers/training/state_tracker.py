@@ -564,3 +564,23 @@ class StateTracker:
     @classmethod
     def set_last_lr(cls, last_lr: float):
         cls.last_lr = float(last_lr)
+
+    @classmethod
+    def should_include_dataset(cls, include_epochs, exclude_epochs):
+        current_epoch = cls.get_epoch()
+        if include_epochs and current_epoch not in include_epochs:
+            return False
+        if exclude_epochs and current_epoch in exclude_epochs:
+            return False
+        return True
+
+    @classmethod
+    def get_epoch_percentage(cls):
+        return cls.epoch_step / cls.args.max_train_steps
+
+    @classmethod
+    def should_include_dataset(cls, include_percentage, exclude_percentage):
+        current_epoch_percentage = cls.get_epoch_percentage()
+        if include_percentage <= current_epoch_percentage < exclude_percentage:
+            return True
+        return False

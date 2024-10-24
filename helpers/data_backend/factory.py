@@ -229,6 +229,10 @@ def init_backend_config(backend: dict, args: dict, accelerator) -> dict:
             f"When a data backend is configured to use `'resolution_type':pixel`, `target_downsample_size` must be at least 512 pixels. You may have accidentally entered {target_downsample_size} megapixels, instead of pixels."
         )
 
+    # Read include_percentage and exclude_percentage fields
+    output["config"]["include_percentage"] = backend.get("include_percentage", 0.0)
+    output["config"]["exclude_percentage"] = backend.get("exclude_percentage", 1.0)
+
     return output
 
 
@@ -1102,7 +1106,17 @@ def configure_multi_databackend(args: dict, accelerator, text_encoders, tokenize
         raise ValueError(
             "Must provide at least one data backend in the data backend config file."
         )
-    return StateTracker.get_data_backends()
+
+    # Filter datasets based on current epoch percentage
+    current_epoch_percentage = StateTracker.get_epoch_percentage()
+    filtered_backends = {}
+    for backend_id, backend in StateTracker.get_data_backends().items():
+        include_percentage = backend["config"].get("include_percentage", 0.0)
+        exclude_percentage = backend["config"].get("exclude_percentage", 1.0)
+        if include_percentage <= current_epoch_percentage < exclude_percentage:
+            filtered_backends[backend_id] = backend
+
+    return filtered_backends
 
 
 def get_local_backend(
