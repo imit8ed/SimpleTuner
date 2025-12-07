@@ -15,6 +15,7 @@ from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
+import toml
 import simpletuner.helpers.models  # noqa: F401  # Ensure model registry population
 from simpletuner.helpers.models.registry import ModelRegistry
 
@@ -541,6 +542,7 @@ class ConfigState:
         self.registry = field_service.field_registry
         self.field_defs = self._load_field_definitions()
         self.aliases = {name: self._compute_aliases(field) for name, field in self.field_defs.items()}
+        self.default_values = self._build_default_values()
         self.values = self._initialize_defaults()
         self.loaded_config_path: Optional[str] = None
         self.webui_defaults: Dict[str, Any] = {}
@@ -559,12 +561,18 @@ class ConfigState:
             definitions[field.name] = field
         return definitions
 
-    def _initialize_defaults(self) -> Dict[str, Any]:
+    def _build_default_values(self) -> Dict[str, Any]:
         defaults: Dict[str, Any] = {}
         for name, field in self.field_defs.items():
             if getattr(field, "webui_only", False):
                 continue
-            defaults[name] = field.default_value
+            defaults[name] = copy.deepcopy(field.default_value)
+        return defaults
+
+    def _initialize_defaults(self) -> Dict[str, Any]:
+        defaults: Dict[str, Any] = {}
+        for name, value in self.default_values.items():
+            defaults[name] = copy.deepcopy(value)
         return defaults
 
     def _compute_aliases(self, field: Any) -> List[str]:
@@ -596,7 +604,7 @@ class ConfigState:
             return self.values[field_name]
         field = self.field_defs.get(field_name)
         if field and not getattr(field, "webui_only", False):
-            return field.default_value
+            return copy.deepcopy(self.default_values.get(field_name, field.default_value))
         return None
 
     def get_lycoris_config_path(self) -> str:
@@ -687,7 +695,8 @@ class ConfigState:
             if getattr(field, "webui_only", False):
                 continue
 
-            value = self.values.get(name, field.default_value)
+            default_value = self.default_values.get(name, field.default_value)
+            value = self.values.get(name, default_value)
             data[name] = value
             data[f"--{name}"] = value
 
@@ -701,27 +710,37 @@ class ConfigState:
         self._enforce_wan_i2v_dataset_requirements(data)
         return data
 
-    def to_serializable(self) -> Dict[str, Any]:
-        """Return a serializable dictionary suitable for writing to disk."""
+    def to_serializable(self, skip_defaults: bool = False) -> Dict[str, Any]:
+        """Return a serializable dictionary suitable for writing to disk.
+
+        When skip_defaults is True, values matching FieldRegistry defaults are omitted.
+        """
 
         self._enforce_wan_i2v_dataset_requirements()
-        data = dict(self.unknown_values)
+        data = {key: value for key, value in self.unknown_values.items() if value is not None}
         for name, field in self.field_defs.items():
             if getattr(field, "webui_only", False):
                 continue
-            value = self.values.get(name, field.default_value)
+            default_value = self.default_values.get(name, field.default_value)
+            value = self.values.get(name, default_value)
             if value is None:
+                continue
+            if skip_defaults and value == default_value:
                 continue
             data[name] = value
         self._enforce_wan_i2v_dataset_requirements(data)
         return data
 
     def load_from_file(self, config_path: str) -> bool:
-        """Load configuration from a JSON file."""
+        """Load configuration from a JSON or TOML file."""
 
+        path = Path(config_path)
         try:
-            with open(config_path, "r", encoding="utf-8") as handle:
-                payload = json.load(handle)
+            if path.suffix.lower() == ".toml":
+                payload = toml.load(path)
+            else:
+                with path.open("r", encoding="utf-8") as handle:
+                    payload = json.load(handle)
         except Exception:
             return False
 
@@ -729,7 +748,7 @@ class ConfigState:
             return False
 
         self.apply_config(payload)
-        self.loaded_config_path = config_path
+        self.loaded_config_path = str(path)
         return True
 
     def apply_config(self, payload: Dict[str, Any]) -> None:
@@ -877,9 +896,9 @@ class SimpleTunerNCurses:
         self._section_menu_indices: Dict[str, int] = {}
         self._field_menu_indices: Dict[Tuple[str, str], int] = {}
 
-        default_config = Path("config/config.json")
-        if default_config.exists():
-            self.state.load_from_file(str(default_config))
+        for default_config in (Path("config/config.toml"), Path("config/config.json")):
+            if default_config.exists() and self.state.load_from_file(str(default_config)):
+                break
 
     def _build_tab_entries(self) -> List[TabEntry]:
         entries: List[TabEntry] = []
@@ -1965,11 +1984,39 @@ class SimpleTunerNCurses:
             return "Not set"
         return str(value)
 
+    def _prepare_config_for_output(self, config_data: Dict[str, Any]) -> Dict[str, Any]:
+        def _normalize(value: Any) -> Any:
+            if isinstance(value, dict):
+                ordered: Dict[str, Any] = {}
+                for key in sorted(value):
+                    normalized_value = _normalize(value[key])
+                    if normalized_value is None:
+                        continue
+                    ordered[key] = normalized_value
+                return ordered
+            if isinstance(value, (list, tuple)):
+                normalized_items = [_normalize(item) for item in value]
+                return [item for item in normalized_items if item is not None]
+            if isinstance(value, Path):
+                return str(value)
+            return value
+
+        return _normalize(config_data)
+
+    def _render_toml_preview(self, config_data: Dict[str, Any]) -> str:
+        try:
+            preview = toml.dumps(config_data).strip()
+            return preview or "# No non-default values selected.\n"
+        except Exception as exc:
+            fallback = json.dumps(config_data, indent=2, sort_keys=True)
+            return f"# TOML preview unavailable: {exc}\n{fallback}"
+
     def review_and_save(self, stdscr) -> None:
         """Show current configuration and optionally write it to disk."""
 
-        config_data = self.state.to_serializable()
-        self._display_json(stdscr, config_data)
+        config_data = self._prepare_config_for_output(self.state.to_serializable(skip_defaults=True))
+        preview = self._render_toml_preview(config_data)
+        self._display_text(stdscr, preview, "Review Configuration (TOML)")
         choice = self.show_options(
             stdscr,
             "Choose an action:",
@@ -1979,18 +2026,18 @@ class SimpleTunerNCurses:
         if choice == 0:
             self._save_config(stdscr, config_data)
 
-    def _display_json(self, stdscr, data: Dict[str, Any]) -> None:
-        """Render configuration data with simple scrolling."""
+    def _display_text(self, stdscr, text: str, title: str) -> None:
+        """Render arbitrary text with simple scrolling."""
 
-        text = json.dumps(data, indent=2, sort_keys=True)
         lines = text.splitlines()
+        if not lines:
+            lines = [""]
         start = 0
 
         while True:
             stdscr.clear()
             h, w = stdscr.getmaxyx()
-            title = "Review Configuration"
-            stdscr.addstr(1, (w - len(title)) // 2, title, curses.A_BOLD)
+            stdscr.addstr(1, max(0, (w - len(title)) // 2), title, curses.A_BOLD)
 
             max_lines = h - 5
             y = 3
@@ -2017,10 +2064,25 @@ class SimpleTunerNCurses:
             elif key == curses.KEY_DOWN and start < max(0, len(lines) - 1):
                 start += 1
 
+    def _display_json(self, stdscr, data: Dict[str, Any]) -> None:
+        """Render configuration data with simple scrolling."""
+
+        text = json.dumps(data, indent=2, sort_keys=True)
+        self._display_text(stdscr, text, "Review Configuration")
+
+    def _default_save_path(self) -> str:
+        if self.state.loaded_config_path:
+            current_path = Path(self.state.loaded_config_path)
+            if current_path.suffix.lower() == ".json":
+                return str(current_path.with_suffix(".toml"))
+            return str(current_path)
+        return "config/config.toml"
+
     def _save_config(self, stdscr, config_data: Dict[str, Any]) -> None:
         """Persist configuration to disk."""
 
-        default_path = self.state.loaded_config_path or "config/config.json"
+        prepared_config = self._prepare_config_for_output(config_data)
+        default_path = self._default_save_path()
         path = self.get_input(stdscr, "Enter file path to save config:", default_path)
         if not path:
             self.show_error(stdscr, "Path cannot be empty.")
@@ -2029,8 +2091,14 @@ class SimpleTunerNCurses:
         try:
             target = Path(path)
             target.parent.mkdir(parents=True, exist_ok=True)
-            with target.open("w", encoding="utf-8") as handle:
-                json.dump(config_data, handle, indent=4, sort_keys=True)
+            suffix = target.suffix.lower()
+            if suffix == ".json":
+                with target.open("w", encoding="utf-8") as handle:
+                    json.dump(prepared_config, handle, indent=4, sort_keys=True)
+            else:
+                toml_text = toml.dumps(prepared_config)
+                with target.open("w", encoding="utf-8") as handle:
+                    handle.write(toml_text)
             self.state.loaded_config_path = str(target)
             self.show_message(stdscr, f"Configuration saved to {target}")
         except Exception as exc:

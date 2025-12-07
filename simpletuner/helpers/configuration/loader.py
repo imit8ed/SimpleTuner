@@ -35,15 +35,15 @@ def attach_env_to_path_if_not_present(backend: str, env: str = None):
 
 
 def auto_detect_config_backend(config_env: str = "default"):
-    """Auto-detect configuration backend based on file existence, defaulting to JSON."""
+    """Auto-detect configuration backend based on file existence, preferring TOML if present."""
     config_base_path = "config"
     if config_env and config_env != "default":
         config_base_path = os.path.join("config", config_env)
 
-    # Check for config files in priority order: json, toml, env
+    # Check for config files in priority order: toml, json, env
     for backend, filename in [
-        ("json", "config.json"),
         ("toml", "config.toml"),
+        ("json", "config.json"),
         ("env", "config.env"),
     ]:
         config_path = os.path.join(config_base_path, filename)

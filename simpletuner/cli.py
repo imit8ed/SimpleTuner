@@ -27,14 +27,14 @@ CONFIG_FILENAMES = {
 def find_config_file() -> Optional[str]:
     """Find config file in current directory or config/ subdirectory."""
     # Check for config.json in current directory
-    for config_name in ["config.json", "config.toml", "config.env"]:
+    for config_name in ["config.toml", "config.json", "config.env"]:
         if os.path.exists(config_name):
             return config_name
 
     # Check for config files in config/ subdirectory
     config_dir = Path("config")
     if config_dir.exists():
-        for config_name in ["config.json", "config.toml", "config.env"]:
+        for config_name in ["config.toml", "config.json", "config.env"]:
             config_path = config_dir / config_name
             if config_path.exists():
                 return str(config_path)
