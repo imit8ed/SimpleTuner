@@ -531,6 +531,21 @@ def _dataset_overview_for_model(model: ModelFoundation, dataset_id: str, dataset
     return sampler.log_state(show_rank=False, alt_stats=True)
 
 
+def _render_validation_gallery(validation_gallery: list[dict[str, str]] | None) -> str:
+    if not validation_gallery:
+        return ""
+    lines = ["## Checkpoint Validation Images", ""]
+    for entry in validation_gallery:
+        path = entry.get("path")
+        if not path:
+            continue
+        caption = entry.get("caption") or "Validation sample"
+        lines.append(f"- {caption}")
+        lines.append(f"![{caption}]({path})")
+        lines.append("")
+    return "\n".join(lines)
+
+
 def save_model_card(
     model: ModelFoundation,
     repo_id: str,
@@ -541,6 +556,7 @@ def save_model_card(
     validation_prompts: list = None,
     validation_shortnames: list = None,
     repo_folder: str = None,
+    validation_gallery: list[dict[str, str]] | None = None,
 ):
     if repo_folder is None:
         raise ValueError("The repo_folder must be specified and not be None.")
@@ -598,6 +614,7 @@ def save_model_card(
                 sub_idx += 1
 
             shortname_idx += 1
+    gallery_section = _render_validation_gallery(validation_gallery)
     args = StateTracker.get_args()
     sage_usage = getattr(args.sageattention_usage, "value", args.sageattention_usage)
     yaml_content = f"""---
@@ -645,6 +662,8 @@ Note: The validation settings are not necessarily the same as the [training sett
 {'You can find some example images in the following gallery:' if images is not None else ''}\n
 
 <Gallery />
+
+{gallery_section}
 
 The text encoder {'**was**' if train_text_encoder else '**was not**'} trained.
 {'You may reuse the base model text encoder for inference.' if not train_text_encoder else 'If the text encoder from this repository is not used at inference time, unexpected or bad results could occur.'}

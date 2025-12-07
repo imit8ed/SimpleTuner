@@ -1,5 +1,7 @@
+import json
 import logging
 import os
+import shutil
 from pathlib import Path
 
 from huggingface_hub import create_repo, upload_file, upload_folder
@@ -32,6 +34,173 @@ class HubManager:
         self.validation_prompts = None
         self.validation_shortnames = None
         self.collected_data_backend_str = None
+
+    # ------------------------------------------------------------------
+    # Helper utilities
+    def _checkpoint_repo_subdir(self, override_path: str | Path | None) -> str | None:
+        """Return a stable repo subdirectory name for checkpoint uploads."""
+
+        if not override_path:
+            return None
+        path = Path(override_path)
+
+        # Prefer structured data from training_state.json
+        state_path = path / "training_state.json"
+        step = None
+        epoch = None
+        if state_path.exists():
+            try:
+                with state_path.open("r", encoding="utf-8") as handle:
+                    state = json.load(handle)
+                step = state.get("global_step") or state.get("global_steps")
+                epoch = state.get("epoch")
+            except Exception:
+                step = None
+                epoch = None
+
+        # Fallback: parse checkpoint-<step> from directory name
+        if step is None:
+            name = path.name
+            if name.startswith("checkpoint-"):
+                try:
+                    step = int(name.split("-", maxsplit=2)[1])
+                except (IndexError, ValueError):
+                    step = None
+
+        if step is not None:
+            return f"step-{int(step)}"
+        if epoch is not None:
+            try:
+                return f"epoch-{int(epoch)}"
+            except (TypeError, ValueError):
+                return None
+        return path.name
+
+    def _checkpoint_suffix_label(self, override_path: str | Path | None) -> str | None:
+        """Return a suffix describing the checkpoint, e.g., step-300 or epoch-12."""
+
+        if not override_path:
+            return None
+        return self._checkpoint_repo_subdir(override_path)
+
+    def _format_learning_rate_token(self) -> str | None:
+        """Return compact LR token (e.g., 1e4 for 1e-4) with the minus implied."""
+
+        lr_value = getattr(self.config, "learning_rate", None)
+        try:
+            lr = float(lr_value)
+        except (TypeError, ValueError):
+            return None
+        if lr <= 0:
+            return None
+        # Use scientific notation, strip negative sign from exponent, and drop leading zeros
+        mantissa, _, exponent = f"{lr:.0e}".partition("e")
+        exponent = exponent.lstrip("+").replace("-", "")
+        exponent = exponent.lstrip("0") or "0"
+        return f"{mantissa}e{exponent}"
+
+    def _base_lora_name(self) -> str:
+        base = self.config.hub_model_id or self.config.tracker_project_name or "model"
+        return base.replace("/", "-").replace(" ", "-")
+
+    def _lora_filename(self, override_path: str | Path | None = None) -> str:
+        """Construct a descriptive LoRA filename respecting hub_model_id, rank, LR, and checkpoint."""
+
+        name_parts = [self._base_lora_name()]
+        rank = getattr(self.config, "lora_rank", None)
+        if isinstance(rank, str):
+            try:
+                rank = int(rank)
+            except (TypeError, ValueError):
+                rank = None
+        rank_token = f"r{int(rank)}" if isinstance(rank, int) or (isinstance(rank, float) and rank.is_integer()) else None
+        lr_token = self._format_learning_rate_token()
+
+        base_lower = name_parts[0].lower()
+        if rank_token and rank_token.lower() not in base_lower:
+            name_parts.append(rank_token)
+        if lr_token:
+            # Accept both implied-negative (1e4) and explicit-negative (1e-4) matches
+            negative_lr_token = lr_token[:2] + "-" + lr_token[2:] if "e" in lr_token else lr_token
+            if lr_token.lower() not in base_lower and negative_lr_token.lower() not in base_lower:
+                name_parts.append(lr_token)
+
+        checkpoint_suffix = self._checkpoint_suffix_label(override_path) if override_path else None
+        if checkpoint_suffix:
+            name_parts.append(checkpoint_suffix)
+
+        return "-".join(name_parts)
+
+    def _parse_validation_filename(self, filename: str) -> tuple[int | None, str | None, str | None]:
+        """Parse step, shortname, resolution from validation image filename."""
+
+        # Expected: step_<step>_<shortname>_<idx>_<res>.png
+        name = Path(filename).stem
+        parts = name.split("_")
+        if len(parts) < 4 or parts[0] != "step":
+            return None, None, None
+        try:
+            step = int(parts[1])
+        except (TypeError, ValueError):
+            step = None
+        if len(parts) >= 3:
+            shortname_parts = parts[2:-2] or ["validation"]
+            shortname = "_".join(shortname_parts)
+        else:
+            shortname = None
+        resolution = parts[-1] if parts else None
+        return step, shortname, resolution
+
+    def _collect_validation_gallery(self, repo_folder: str) -> list[dict[str, str]]:
+        """Copy all saved validation images and return gallery metadata for the README."""
+
+        source_dir = Path(self.config.output_dir) / "validation_images"
+        if not source_dir.exists():
+            return []
+
+        prompt_map = {}
+        if self.validation_prompts is not None and self.validation_shortnames is not None:
+            for shortname, prompt in zip(self.validation_shortnames, self.validation_prompts):
+                if shortname is None or prompt is None:
+                    continue
+                prompt_map[str(shortname)] = str(prompt)
+
+        assets_dir = Path(repo_folder) / "assets" / "validation"
+        assets_dir.mkdir(parents=True, exist_ok=True)
+        gallery_entries: list[dict[str, str]] = []
+
+        for img_path in sorted(source_dir.glob("step_*")):
+            if not img_path.is_file():
+                continue
+            step, shortname, resolution = self._parse_validation_filename(img_path.name)
+            try:
+                target = assets_dir / img_path.name
+                if not target.exists():
+                    shutil.copy2(img_path, target)
+                caption_parts = []
+                if shortname:
+                    caption_parts.append(shortname)
+                prompt_text = prompt_map.get(shortname or "")
+                if prompt_text:
+                    caption_parts.append(prompt_text)
+                details = []
+                if step is not None:
+                    details.append(f"step {step}")
+                if resolution:
+                    details.append(resolution)
+                caption_suffix = f" ({', '.join(details)})" if details else ""
+                caption = " — ".join(caption_parts) + caption_suffix if caption_parts else f"Validation{caption_suffix}"
+                gallery_entries.append(
+                    {
+                        "path": f"./assets/validation/{img_path.name}",
+                        "caption": caption,
+                    }
+                )
+            except Exception as err:
+                logger.debug("Failed to process validation image %s: %s", img_path, err)
+                continue
+
+        return gallery_entries
 
     def _create_repo(self):
         if not self.config.push_to_hub:
@@ -97,11 +266,12 @@ class HubManager:
             )
         if not self.config.push_to_hub:
             return
+        repo_subdir = self._checkpoint_repo_subdir(override_path)
         try:
             upload_folder(
                 repo_id=self._repo_id,
                 folder_path=os.path.join(override_path or self.config.output_dir, "assets"),
-                path_in_repo="assets/",
+                path_in_repo=f"{repo_subdir}/assets/" if repo_subdir else "assets/",
                 commit_message="Validation images auto-generated by SimpleTuner",
             )
         except Exception as e:
@@ -112,6 +282,8 @@ class HubManager:
             self.config.output_dir,
             "pipeline" if "lora" not in self.config.model_type else "",
         )
+        repo_subdir = self._checkpoint_repo_subdir(override_path)
+        validation_gallery = self._collect_validation_gallery(repo_folder)
         save_training_config(repo_folder=repo_folder, config=self.config)
         save_model_card(
             model=self.model,
@@ -123,6 +295,7 @@ class HubManager:
             validation_prompts=self.validation_prompts,
             validation_shortnames=self.validation_shortnames,
             repo_folder=repo_folder,
+            validation_gallery=validation_gallery,
         )
         if not self.config.push_to_hub:
             return
@@ -164,7 +337,7 @@ class HubManager:
                         message_level="info",
                         job_id=StateTracker.get_job_id(),
                     )
-        repo_url = self._repo_url()
+        repo_url = self._repo_url(repo_subdir if override_path else None)
         if webhook_handler:
             webhook_handler.send(message=f"Model is now available [on Hugging Face Hub]({repo_url}).")
             webhook_handler.send_raw(
@@ -179,10 +352,12 @@ class HubManager:
         if not self.config.push_to_hub:
             return
         folder_path = os.path.join(self.config.output_dir, "pipeline")
+        repo_subdir = self._checkpoint_repo_subdir(override_path)
         try:
             upload_folder(
                 repo_id=self._repo_id,
                 folder_path=override_path or folder_path,
+                path_in_repo=f"{repo_subdir}" if repo_subdir else "",
                 commit_message=self._commit_message(),
             )
         except Exception as e:
@@ -196,17 +371,28 @@ class HubManager:
         if not os.path.exists(lora_weights_path):
             raise FileNotFoundError(f"Missing required artifact: {lora_weights_path}")
         sla_path = os.path.join(checkpoint_root, SLA_ATTENTION_FILENAME)
+        repo_subdir = self._checkpoint_repo_subdir(override_path)
+        lora_filename = f"{self._lora_filename(override_path)}.safetensors"
+        default_lora_path = f"{repo_subdir}/{LORA_SAFETENSORS_FILENAME}" if repo_subdir else LORA_SAFETENSORS_FILENAME
         try:
             upload_file(
                 repo_id=self._repo_id,
-                path_in_repo=f"/{LORA_SAFETENSORS_FILENAME}",
+                path_in_repo=f"{repo_subdir}/{lora_filename}" if repo_subdir else lora_filename,
                 path_or_fileobj=lora_weights_path,
                 commit_message=self._commit_message(),
             )
+            # Retain the canonical filename for downstream loaders, but avoid overwriting final uploads unnecessarily.
+            if lora_filename != LORA_SAFETENSORS_FILENAME or repo_subdir:
+                upload_file(
+                    repo_id=self._repo_id,
+                    path_in_repo=default_lora_path,
+                    path_or_fileobj=lora_weights_path,
+                    commit_message=self._commit_message(),
+                )
             if os.path.exists(sla_path):
                 upload_file(
                     repo_id=self._repo_id,
-                    path_in_repo=f"/{SLA_ATTENTION_FILENAME}",
+                    path_in_repo=f"{repo_subdir}/{SLA_ATTENTION_FILENAME}" if repo_subdir else SLA_ATTENTION_FILENAME,
                     path_or_fileobj=sla_path,
                     commit_message="SLA attention state auto-generated by SimpleTuner",
                 )
@@ -215,7 +401,7 @@ class HubManager:
             readme_path = os.path.join(checkpoint_root, "README.md")
             upload_file(
                 repo_id=self._repo_id,
-                path_in_repo="/README.md",
+                path_in_repo=f"{repo_subdir}/README.md" if repo_subdir else "README.md",
                 path_or_fileobj=readme_path,
                 commit_message="Model card auto-generated by SimpleTuner",
             )
@@ -226,6 +412,7 @@ class HubManager:
     def upload_ema_model(self, override_path=None):
         if not self.config.push_to_hub or not self.config.use_ema:
             return
+        repo_subdir = self._checkpoint_repo_subdir(override_path)
         try:
             check_ema_paths = ["transformer_ema", "unet_ema", "controlnet_ema", "ema"]
             # if any of the folder names are present in the checkpoint dir, we will upload them too
@@ -237,7 +424,7 @@ class HubManager:
                     upload_folder(
                         repo_id=self._repo_id,
                         folder_path=ema_path,
-                        path_in_repo="/ema",
+                        path_in_repo=f"{repo_subdir}/ema" if repo_subdir else "ema",
                         commit_message="LoRA EMA checkpoint auto-generated by SimpleTuner",
                     )
         except Exception as e:
@@ -309,14 +496,19 @@ class HubManager:
                     override_path=checkpoint_path,
                     webhook_handler=webhook_handler,
                 )
-                remote_path = self._repo_url(checkpoint_path.name)
+                repo_subdir = self._checkpoint_repo_subdir(checkpoint_path)
+                remote_path = self._repo_url(repo_subdir or checkpoint_path.name)
                 return remote_path, str(checkpoint_path), repo_url
             except Exception as e:
                 logger.error(f"Failed to upload latest checkpoint: {e}")
                 import traceback
 
                 logger.error(traceback.format_exc())
-        return None, str(checkpoint_path) if checkpoint_path else None, self._repo_url() if self.config.push_to_hub else None
+        return (
+            None,
+            str(checkpoint_path) if checkpoint_path else None,
+            self._repo_url(self._checkpoint_repo_subdir(checkpoint_path)) if self.config.push_to_hub else None,
+        )
 
     def upload_validation_images(self, validation_images, webhook_handler=None, override_path=None):
         logging.info(f"Validation images for upload: {validation_images}")
