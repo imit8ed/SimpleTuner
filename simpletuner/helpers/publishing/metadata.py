@@ -137,13 +137,14 @@ The EMA model may provide a more well-rounded result, but typically will feel un
     return ""
 
 
-def lycoris_download_info():
+def lycoris_download_info(adapter_filename: str | None = None):
     """output a function to download the adapter"""
+    adapter_filename = adapter_filename or "pytorch_lora_weights.safetensors"
     output_fn = """
 def download_adapter(repo_id: str):
     import os
     from huggingface_hub import hf_hub_download
-    adapter_filename = "pytorch_lora_weights.safetensors"
+    adapter_filename = "%s"
     cache_dir = os.environ.get('HF_PATH', os.path.expanduser('~/.cache/huggingface/hub/models'))
     cleaned_adapter_path = repo_id.replace("/", "_").replace("\\\\", "_").replace(":", "_")
     path_to_adapter = os.path.join(cache_dir, cleaned_adapter_path)
@@ -156,7 +157,7 @@ def download_adapter(repo_id: str):
     return path_to_adapter_file
     """
 
-    return output_fn
+    return output_fn % adapter_filename
 
 
 def _model_component_name(model):
@@ -165,7 +166,7 @@ def _model_component_name(model):
     return model_component_name
 
 
-def _model_load(args, repo_id: str = None, model=None):
+def _model_load(args, repo_id: str = None, model=None, adapter_filename: str | None = None):
     model_component_name = _model_component_name(model)
     hf_user_name = StateTracker.get_hf_username()
     if hf_user_name is not None:
@@ -177,20 +178,22 @@ def _model_load(args, repo_id: str = None, model=None):
                 # we'll import the SingLoRA setup function
                 lora_imports += "from peft_singlora import setup_singlora\n"
                 lora_imports += "setup_singlora() # overwrites the nn.Linear mapping in PEFT.\n\n"
+            weight_name_arg = f", weight_name='{adapter_filename}'" if adapter_filename else ""
 
             output = (
                 f"{lora_imports}"
                 f"model_id = '{args.pretrained_model_name_or_path}'"
                 f"\nadapter_id = '{repo_id if repo_id is not None else args.output_dir}'"
                 f"\npipeline = DiffusionPipeline.from_pretrained(model_id, torch_dtype={StateTracker.get_weight_dtype()}) # loading directly in bf16"
-                f"\npipeline.load_lora_weights(adapter_id)"
+                f"\npipeline.load_lora_weights(adapter_id{weight_name_arg})"
             )
         elif args.lora_type.lower() == "lycoris":
+            selected_adapter_filename = adapter_filename or "pytorch_lora_weights.safetensors"
             output = (
-                f"{lycoris_download_info()}"
+                f"{lycoris_download_info(adapter_filename=selected_adapter_filename)}"
                 f"\nmodel_id = '{args.pretrained_model_name_or_path}'"
                 f"\nadapter_repo_id = '{repo_id if repo_id is not None else args.output_dir}'"
-                f"\nadapter_filename = 'pytorch_lora_weights.safetensors'"
+                f"\nadapter_filename = '{selected_adapter_filename}'"
                 f"\nadapter_file_path = download_adapter(repo_id=adapter_repo_id)"
                 f"\npipeline = DiffusionPipeline.from_pretrained(model_id, torch_dtype={StateTracker.get_weight_dtype()}) # loading directly in bf16"
                 "\nlora_scale = 1.0"
@@ -292,7 +295,7 @@ model_output.save("output.png", format="PNG")
 """
 
 
-def code_example(args, repo_id: str = None, model=None):
+def code_example(args, repo_id: str = None, model=None, adapter_filename: str | None = None):
     """Return a string with the code example."""
     # Check if model provides custom code example
     if model and hasattr(model, "custom_model_card_code_example"):
@@ -303,7 +306,7 @@ def code_example(args, repo_id: str = None, model=None):
 ```python
 {_model_imports(args)}
 
-{_model_load(args, repo_id, model=model)}
+{_model_load(args, repo_id, model=model, adapter_filename=adapter_filename)}
 
 prompt = "{args.validation_prompt if args.validation_prompt else 'An astronaut is riding a horse through the jungles of Thailand.'}"
 {_negative_prompt(args)}
@@ -531,21 +534,6 @@ def _dataset_overview_for_model(model: ModelFoundation, dataset_id: str, dataset
     return sampler.log_state(show_rank=False, alt_stats=True)
 
 
-def _render_validation_gallery(validation_gallery: list[dict[str, str]] | None) -> str:
-    if not validation_gallery:
-        return ""
-    lines = ["## Checkpoint Validation Images", ""]
-    for entry in validation_gallery:
-        path = entry.get("path")
-        if not path:
-            continue
-        caption = entry.get("caption") or "Validation sample"
-        lines.append(f"- {caption}")
-        lines.append(f"![{caption}]({path})")
-        lines.append("")
-    return "\n".join(lines)
-
-
 def save_model_card(
     model: ModelFoundation,
     repo_id: str,
@@ -557,6 +545,7 @@ def save_model_card(
     validation_shortnames: list = None,
     repo_folder: str = None,
     validation_gallery: list[dict[str, str]] | None = None,
+    adapter_filename: str | None = None,
 ):
     if repo_folder is None:
         raise ValueError("The repo_folder must be specified and not be None.")
@@ -614,7 +603,6 @@ def save_model_card(
                 sub_idx += 1
 
             shortname_idx += 1
-    gallery_section = _render_validation_gallery(validation_gallery)
     args = StateTracker.get_args()
     sage_usage = getattr(args.sageattention_usage, "value", args.sageattention_usage)
     yaml_content = f"""---
@@ -655,6 +643,7 @@ This is a {model_type(args)} derived from [{base_model}](https://huggingface.co/
 - Sampler: `{'FlowMatchEulerDiscreteScheduler' if model.PREDICTION_TYPE.value == "flow_matching" else StateTracker.get_args().validation_noise_scheduler}`
 - Seed: `{StateTracker.get_args().validation_seed}`
 - Resolution{'s' if ',' in str(StateTracker.get_args().validation_resolution) else ''}: `{str(StateTracker.get_args().validation_resolution)}`
+- Image format: `{getattr(StateTracker.get_args(), "validation_image_format", "png")}`
 {f"- Skip-layer guidance: {_skip_layers(args)}" if args.model_family in ['sd3', 'flux'] else ''}
 
 Note: The validation settings are not necessarily the same as the [training settings](#training-settings).
@@ -662,8 +651,6 @@ Note: The validation settings are not necessarily the same as the [training sett
 {'You can find some example images in the following gallery:' if images is not None else ''}\n
 
 <Gallery />
-
-{gallery_section}
 
 The text encoder {'**was**' if train_text_encoder else '**was not**'} trained.
 {'You may reuse the base model text encoder for inference.' if not train_text_encoder else 'If the text encoder from this repository is not used at inference time, unexpected or bad results could occur.'}
@@ -698,7 +685,7 @@ The text encoder {'**was**' if train_text_encoder else '**was not**'} trained.
 
 ## Inference
 
-{code_example(args=StateTracker.get_args(), repo_id=repo_id, model=model)}
+{code_example(args=StateTracker.get_args(), repo_id=repo_id, model=model, adapter_filename=adapter_filename)}
 
 {ema_info(args=StateTracker.get_args())}
 """

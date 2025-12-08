@@ -16,6 +16,17 @@ def save_images(save_dir, validation_images, validation_shortname, validation_re
     """
     Save validation images to disk.
     """
+    image_format = str(getattr(config, "validation_image_format", "png") or "png").lower()
+    if image_format in {"jpeg", "jpg"}:
+        pil_format = "JPEG"
+        extension = "jpg"
+    elif image_format == "webp":
+        pil_format = "WEBP"
+        extension = "webp"
+    else:
+        pil_format = "PNG"
+        extension = "png"
+
     validation_img_idx = 0
     resolutions = [_res for res in validation_resolutions for _res in [res] * config.num_eval_images]
 
@@ -35,11 +46,13 @@ def save_images(save_dir, validation_images, validation_shortname, validation_re
             else:
                 res_label = f"{res}x{res}"
 
-        filename = f"step_{StateTracker.get_global_step()}_{validation_shortname}_{validation_img_idx}_{res_label}.png"
+        filename = (
+            f"step_{StateTracker.get_global_step()}_{validation_shortname}_{validation_img_idx}_{res_label}.{extension}"
+        )
         save_path = os.path.join(save_dir, filename)
 
         try:
-            validation_image.save(save_path)
+            validation_image.save(save_path, format=pil_format)
         except Exception as e:
             logger.error(f"Failed to save validation image to {save_path}: {e}")
 

@@ -3650,7 +3650,9 @@ class Trainer:
             return False
         return epoch > 0 and epoch % interval == 0
 
-    def _run_standard_checkpoint(self, webhook_message: str | None, parent_loss, epoch: int, *, upload_to_hub: bool = False):
+    def _run_standard_checkpoint(
+        self, webhook_message: str | None, parent_loss, epoch: int, *, upload_to_hub: bool = False, checkpoint_context: str | None = None
+    ):
         if webhook_message:
             self._send_webhook_msg(
                 message=f"Checkpoint: `{webhook_message}`",
@@ -3701,6 +3703,7 @@ class Trainer:
                     remote_path, local_path, repo_url = self.hub_manager.upload_latest_checkpoint(
                         validation_images=validation_images,
                         webhook_handler=self.webhook_handler,
+                        checkpoint_context=checkpoint_context,
                     )
                     return remote_path, local_path, repo_url
 
@@ -4609,6 +4612,7 @@ class Trainer:
                             parent_loss=parent_loss,
                             epoch=epoch,
                             upload_to_hub=upload_to_hub,
+                            checkpoint_context="step",
                         )
                         checkpoint_saved_this_step = True
                     elif (
@@ -4755,6 +4759,7 @@ class Trainer:
                     parent_loss=parent_loss,
                     epoch=epoch,
                     upload_to_hub=epoch_upload_to_hub,
+                    checkpoint_context="epoch",
                 )
 
             if self.state["global_step"] >= self.config.max_train_steps or (

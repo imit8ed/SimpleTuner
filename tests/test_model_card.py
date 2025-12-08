@@ -100,10 +100,19 @@ class TestMetadataFunctions(unittest.TestCase):
             output = _model_load(self.args, repo_id="repo-id", model=self.mock_model)
             self.assertIn("pipeline.load_lora_weights", output)
             self.assertIn("adapter_id = 'testuser/repo-id'", output)
+            output_with_weight = _model_load(
+                self.args,
+                repo_id="repo-id",
+                model=self.mock_model,
+                adapter_filename="custom-name.safetensors",
+            )
+            self.assertIn("weight_name='custom-name.safetensors'", output_with_weight)
 
         self.args.lora_type = "lycoris"
         output = _model_load(self.args, model=self.mock_model)
         self.assertIn("pytorch_lora_weights.safetensors", output)
+        output = _model_load(self.args, model=self.mock_model, adapter_filename="alt-name.safetensors")
+        self.assertIn("alt-name.safetensors", output)
 
     def test_torch_device(self):
         output = _torch_device()
@@ -241,6 +250,8 @@ class TestMetadataFunctions(unittest.TestCase):
 
             output = lycoris_download_info()
             self.assertIn("hf_hub_download", output)
+            custom_output = lycoris_download_info(adapter_filename="alt-name.safetensors")
+            self.assertIn("alt-name.safetensors", custom_output)
 
     def test_pipeline_move_full_bf16(self):
         from simpletuner.helpers.publishing.metadata import _pipeline_move_to

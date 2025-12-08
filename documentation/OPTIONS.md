@@ -357,6 +357,13 @@ A lot of settings are instead set through the [dataloader config](/documentation
 
 - **What**: Output image resolution, measured in pixels, or, formatted as: `widthxheight`, as in `1024x1024`. Multiple resolutions can be defined, separated by commas.
 - **Why**: All images generated during validation will be this resolution. Useful if the model is being trained with a different resolution.
+- **Default**: 256 (UI default); override to match your model (e.g., `1024x1024`).
+
+### `--validation_image_format`
+
+- **What**: File format used when saving validation images.
+- **Options**: `png` (default, lossless), `jpg` (lossy), `webp` (smaller, lossless/near-lossless).
+- **Why**: Control disk footprint and viewer compatibility of saved validation outputs.
 
 ### `--validation_method`
 
@@ -1203,6 +1210,8 @@ options:
   --validation_resolution VALIDATION_RESOLUTION
                         Override resolution for validation images (pixels or
                         megapixels)
+  --validation_image_format {png,jpg,webp}
+                        File format for saved validation images
   --validation_seed_source {cpu,gpu}
                         Source device used to generate validation seeds
   --validation_torch_compile_mode {default,reduce-overhead,max-autotune}

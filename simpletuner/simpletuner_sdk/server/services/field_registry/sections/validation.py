@@ -868,6 +868,28 @@ def register_validation_fields(registry: "FieldRegistry") -> None:
         )
     )
 
+    # Validation Image Format
+    registry._add_field(
+        ConfigField(
+            name="validation_image_format",
+            arg_name="--validation_image_format",
+            ui_label="Validation Image Format",
+            field_type=FieldType.SELECT,
+            tab="validation",
+            section="validation_options",
+            default_value="png",
+            choices=[
+                {"value": "png", "label": "PNG"},
+                {"value": "jpg", "label": "JPG"},
+                {"value": "webp", "label": "WEBP"},
+            ],
+            help_text="File format used when saving validation outputs.",
+            tooltip="Choose PNG (lossless), JPG (lossy), or WEBP (smaller lossless/near-lossless).",
+            importance=ImportanceLevel.ADVANCED,
+            order=18,
+        )
+    )
+
     # Validation Seed Source
     registry._add_field(
         ConfigField(
@@ -885,7 +907,7 @@ def register_validation_fields(registry: "FieldRegistry") -> None:
             help_text="Source device used to generate validation seeds",
             tooltip="Use CPU-based or GPU-based RNG when deriving validation seeds.",
             importance=ImportanceLevel.ADVANCED,
-            order=18,
+            order=19,
             subsection="advanced",
         )
     )
@@ -908,7 +930,7 @@ def register_validation_fields(registry: "FieldRegistry") -> None:
             help_text="Torch compile mode for validation",
             tooltip="Different compilation modes for torch.compile() during validation.",
             importance=ImportanceLevel.ADVANCED,
-            order=19,
+            order=20,
             subsection="advanced",
         )
     )

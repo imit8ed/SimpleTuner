@@ -37,7 +37,7 @@ class HubManager:
 
     # ------------------------------------------------------------------
     # Helper utilities
-    def _checkpoint_repo_subdir(self, override_path: str | Path | None) -> str | None:
+    def _checkpoint_repo_subdir(self, override_path: str | Path | None, checkpoint_context: str | None = None) -> str | None:
         """Return a stable repo subdirectory name for checkpoint uploads."""
 
         if not override_path:
@@ -67,6 +67,8 @@ class HubManager:
                 except (IndexError, ValueError):
                     step = None
 
+        if checkpoint_context == "epoch" and epoch is not None and step is not None:
+            return f"epoch-{int(epoch)}-step-{int(step)}"
         if step is not None:
             return f"step-{int(step)}"
         if epoch is not None:
@@ -76,12 +78,12 @@ class HubManager:
                 return None
         return path.name
 
-    def _checkpoint_suffix_label(self, override_path: str | Path | None) -> str | None:
+    def _checkpoint_suffix_label(self, override_path: str | Path | None, checkpoint_context: str | None = None) -> str | None:
         """Return a suffix describing the checkpoint, e.g., step-300 or epoch-12."""
 
         if not override_path:
             return None
-        return self._checkpoint_repo_subdir(override_path)
+        return self._checkpoint_repo_subdir(override_path, checkpoint_context)
 
     def _format_learning_rate_token(self) -> str | None:
         """Return compact LR token (e.g., 1e4 for 1e-4) with the minus implied."""
@@ -103,7 +105,7 @@ class HubManager:
         base = self.config.hub_model_id or self.config.tracker_project_name or "model"
         return base.replace("/", "-").replace(" ", "-")
 
-    def _lora_filename(self, override_path: str | Path | None = None) -> str:
+    def _lora_filename(self, override_path: str | Path | None = None, checkpoint_context: str | None = None) -> str:
         """Construct a descriptive LoRA filename respecting hub_model_id, rank, LR, and checkpoint."""
 
         name_parts = [self._base_lora_name()]
@@ -125,7 +127,7 @@ class HubManager:
             if lr_token.lower() not in base_lower and negative_lr_token.lower() not in base_lower:
                 name_parts.append(lr_token)
 
-        checkpoint_suffix = self._checkpoint_suffix_label(override_path) if override_path else None
+        checkpoint_suffix = self._checkpoint_suffix_label(override_path, checkpoint_context) if override_path else None
         if checkpoint_suffix:
             name_parts.append(checkpoint_suffix)
 
@@ -151,7 +153,7 @@ class HubManager:
         resolution = parts[-1] if parts else None
         return step, shortname, resolution
 
-    def _collect_validation_gallery(self, repo_folder: str) -> list[dict[str, str]]:
+    def _collect_validation_gallery(self, repo_folder: str, checkpoint_step: int | None = None) -> list[dict[str, str]]:
         """Copy all saved validation images and return gallery metadata for the README."""
 
         source_dir = Path(self.config.output_dir) / "validation_images"
@@ -173,6 +175,8 @@ class HubManager:
             if not img_path.is_file():
                 continue
             step, shortname, resolution = self._parse_validation_filename(img_path.name)
+            if checkpoint_step is not None and step is not None and step != checkpoint_step:
+                continue
             try:
                 target = assets_dir / img_path.name
                 if not target.exists():
@@ -253,7 +257,7 @@ class HubManager:
         self.validation_prompts = validation_prompts.get("validation_prompts", [])
         self.validation_shortnames = validation_prompts.get("validation_shortnames", [])
 
-    def upload_validation_folder(self, webhook_handler=None, override_path=None):
+    def upload_validation_folder(self, webhook_handler=None, override_path=None, checkpoint_context: str | None = None):
         if webhook_handler:
             webhook_handler.send(
                 message=f"Uploading {'model' if override_path is None else 'intermediary checkpoint'} validation samples to Hugging Face Hub as `{self.repo_id}`."
@@ -263,10 +267,10 @@ class HubManager:
                 message_type="training.status",
                 message_level="info",
                 job_id=StateTracker.get_job_id(),
-            )
+        )
         if not self.config.push_to_hub:
             return
-        repo_subdir = self._checkpoint_repo_subdir(override_path)
+        repo_subdir = self._checkpoint_repo_subdir(override_path, checkpoint_context)
         try:
             upload_folder(
                 repo_id=self._repo_id,
@@ -277,13 +281,23 @@ class HubManager:
         except Exception as e:
             logger.error(f"Error uploading validation images to Hugging Face Hub: {e}")
 
-    def upload_model(self, validation_images, webhook_handler=None, override_path=None):
+    def upload_model(
+        self,
+        validation_images,
+        webhook_handler=None,
+        override_path=None,
+        checkpoint_context: str | None = None,
+        checkpoint_step: int | None = None,
+    ):
         repo_folder = override_path or os.path.join(
             self.config.output_dir,
             "pipeline" if "lora" not in self.config.model_type else "",
         )
-        repo_subdir = self._checkpoint_repo_subdir(override_path)
-        validation_gallery = self._collect_validation_gallery(repo_folder)
+        repo_subdir = self._checkpoint_repo_subdir(override_path, checkpoint_context)
+        adapter_filename = None
+        if "lora" in self.config.model_type:
+            adapter_filename = f"{self._lora_filename(override_path, checkpoint_context)}.safetensors"
+        validation_gallery = self._collect_validation_gallery(repo_folder, checkpoint_step=checkpoint_step)
         save_training_config(repo_folder=repo_folder, config=self.config)
         save_model_card(
             model=self.model,
@@ -296,6 +310,7 @@ class HubManager:
             validation_shortnames=self.validation_shortnames,
             repo_folder=repo_folder,
             validation_gallery=validation_gallery,
+            adapter_filename=adapter_filename,
         )
         if not self.config.push_to_hub:
             return
@@ -311,7 +326,9 @@ class HubManager:
             )
 
         try:
-            self.upload_validation_folder(webhook_handler=webhook_handler, override_path=override_path)
+            self.upload_validation_folder(
+                webhook_handler=webhook_handler, override_path=override_path, checkpoint_context=checkpoint_context
+            )
         except:
             logger.error("Error uploading validation images to Hugging Face Hub.")
 
@@ -320,11 +337,17 @@ class HubManager:
             attempt += 1
             try:
                 if "lora" not in self.config.model_type:
-                    self.upload_full_model(override_path=override_path)
+                    self.upload_full_model(
+                        override_path=override_path, checkpoint_context=checkpoint_context
+                    )
                 else:
-                    self.upload_lora_model(override_path=override_path)
+                    self.upload_lora_model(
+                        override_path=override_path,
+                        lora_filename=adapter_filename,
+                        checkpoint_context=checkpoint_context,
+                    )
                     if self.config.use_ema:
-                        self.upload_ema_model(override_path=override_path)
+                        self.upload_ema_model(override_path=override_path, checkpoint_context=checkpoint_context)
                 break
             except Exception as e:
                 if webhook_handler:
@@ -348,11 +371,11 @@ class HubManager:
             )
         return repo_url
 
-    def upload_full_model(self, override_path=None):
+    def upload_full_model(self, override_path=None, checkpoint_context: str | None = None):
         if not self.config.push_to_hub:
             return
         folder_path = os.path.join(self.config.output_dir, "pipeline")
-        repo_subdir = self._checkpoint_repo_subdir(override_path)
+        repo_subdir = self._checkpoint_repo_subdir(override_path, checkpoint_context)
         try:
             upload_folder(
                 repo_id=self._repo_id,
@@ -363,7 +386,7 @@ class HubManager:
         except Exception as e:
             logger.error(f"Failed to upload pipeline to hub: {e}")
 
-    def upload_lora_model(self, override_path=None):
+    def upload_lora_model(self, override_path=None, lora_filename: str | None = None, checkpoint_context: str | None = None):
         if not self.config.push_to_hub:
             return
         checkpoint_root = override_path or self.config.output_dir
@@ -371,9 +394,8 @@ class HubManager:
         if not os.path.exists(lora_weights_path):
             raise FileNotFoundError(f"Missing required artifact: {lora_weights_path}")
         sla_path = os.path.join(checkpoint_root, SLA_ATTENTION_FILENAME)
-        repo_subdir = self._checkpoint_repo_subdir(override_path)
-        lora_filename = f"{self._lora_filename(override_path)}.safetensors"
-        default_lora_path = f"{repo_subdir}/{LORA_SAFETENSORS_FILENAME}" if repo_subdir else LORA_SAFETENSORS_FILENAME
+        repo_subdir = self._checkpoint_repo_subdir(override_path, checkpoint_context)
+        lora_filename = lora_filename or f"{self._lora_filename(override_path, checkpoint_context)}.safetensors"
         try:
             upload_file(
                 repo_id=self._repo_id,
@@ -381,14 +403,6 @@ class HubManager:
                 path_or_fileobj=lora_weights_path,
                 commit_message=self._commit_message(),
             )
-            # Retain the canonical filename for downstream loaders, but avoid overwriting final uploads unnecessarily.
-            if lora_filename != LORA_SAFETENSORS_FILENAME or repo_subdir:
-                upload_file(
-                    repo_id=self._repo_id,
-                    path_in_repo=default_lora_path,
-                    path_or_fileobj=lora_weights_path,
-                    commit_message=self._commit_message(),
-                )
             if os.path.exists(sla_path):
                 upload_file(
                     repo_id=self._repo_id,
@@ -409,10 +423,10 @@ class HubManager:
             logger.error(f"Failed to upload LoRA artifacts to hub: {e}")
             raise
 
-    def upload_ema_model(self, override_path=None):
+    def upload_ema_model(self, override_path=None, checkpoint_context: str | None = None):
         if not self.config.push_to_hub or not self.config.use_ema:
             return
-        repo_subdir = self._checkpoint_repo_subdir(override_path)
+        repo_subdir = self._checkpoint_repo_subdir(override_path, checkpoint_context)
         try:
             check_ema_paths = ["transformer_ema", "unet_ema", "controlnet_ema", "ema"]
             # if any of the folder names are present in the checkpoint dir, we will upload them too
@@ -446,7 +460,7 @@ class HubManager:
 
         return highest_checkpoint
 
-    def upload_latest_checkpoint(self, validation_images: dict, webhook_handler=None):
+    def upload_latest_checkpoint(self, validation_images: dict, webhook_handler=None, checkpoint_context: str | None = None):
         checkpoint_path = self.find_latest_checkpoint()
         if checkpoint_path:
             logging.info(f"Checkpoint path: {checkpoint_path}")
@@ -495,8 +509,10 @@ class HubManager:
                     validation_images=images_to_upload,
                     override_path=checkpoint_path,
                     webhook_handler=webhook_handler,
+                    checkpoint_context=checkpoint_context,
+                    checkpoint_step=checkpoint_step,
                 )
-                repo_subdir = self._checkpoint_repo_subdir(checkpoint_path)
+                repo_subdir = self._checkpoint_repo_subdir(checkpoint_path, checkpoint_context)
                 remote_path = self._repo_url(repo_subdir or checkpoint_path.name)
                 return remote_path, str(checkpoint_path), repo_url
             except Exception as e:
@@ -507,7 +523,9 @@ class HubManager:
         return (
             None,
             str(checkpoint_path) if checkpoint_path else None,
-            self._repo_url(self._checkpoint_repo_subdir(checkpoint_path)) if self.config.push_to_hub else None,
+            self._repo_url(self._checkpoint_repo_subdir(checkpoint_path, checkpoint_context))
+            if self.config.push_to_hub
+            else None,
         )
 
     def upload_validation_images(self, validation_images, webhook_handler=None, override_path=None):

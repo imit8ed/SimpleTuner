@@ -620,7 +620,62 @@ class PromptHandler:
         try:
             with user_prompt_path.open("r", encoding="utf-8") as f:
                 user_prompts = json.load(f)
-                # logger.debug(f"Loaded user prompts: {user_prompts}")
+            placeholder = "[trigger]"
+            uses_trigger = any(isinstance(prompt, str) and placeholder in prompt for prompt in user_prompts.values())
+            if uses_trigger:
+                data_backends = StateTracker.get_data_backends()
+                if not data_backends:
+                    raise ValueError(
+                        "User prompt library contains [trigger] but no data backends are registered to supply an instance_prompt."
+                    )
+                candidates = []
+                for backend_id, backend in data_backends.items():
+                    config = backend.get("config", {}) or {}
+                    candidate = config.get("instance_prompt")
+                    if candidate is None:
+                        candidate = backend.get("instance_prompt")
+                    if candidate is None:
+                        sampler = backend.get("sampler")
+                        if sampler is not None:
+                            candidate = getattr(sampler, "instance_prompt", None)
+                    if candidate:
+                        candidates.append((backend_id, candidate))
+                if not candidates:
+                    raise ValueError(
+                        "User prompt library contains [trigger] but no dataset instance_prompt is configured. "
+                        "Set an instance_prompt on the dataset or remove [trigger] from the prompt library."
+                    )
+                normalized_candidates = []
+                for backend_id, prompt in candidates:
+                    if isinstance(prompt, (list, tuple, set)):
+                        flattened = [str(p).strip() for p in prompt if p is not None and str(p).strip()]
+                        if len(flattened) > 1:
+                            raise ValueError(
+                                "User prompt library contains [trigger] but a dataset defines multiple instance_prompt values "
+                                f"(id={backend_id}: {flattened}). Provide a single value."
+                            )
+                        prompt = flattened[0] if flattened else None
+                    elif isinstance(prompt, str):
+                        prompt = prompt.strip()
+                    if prompt:
+                        normalized_candidates.append((backend_id, prompt))
+                if not normalized_candidates:
+                    raise ValueError(
+                        "User prompt library contains [trigger] but no dataset instance_prompt is configured. "
+                        "Set an instance_prompt on the dataset or remove [trigger] from the prompt library."
+                    )
+                unique_prompts = {prompt for _, prompt in normalized_candidates}
+                if len(unique_prompts) > 1:
+                    backend_list = ", ".join(f"{bid}: {prompt}" for bid, prompt in normalized_candidates)
+                    raise ValueError(
+                        "User prompt library contains [trigger] but multiple datasets define different instance_prompt values: "
+                        f"{backend_list}. Specify a single dataset or align the instance_prompt values."
+                    )
+                instance_prompt = unique_prompts.pop()
+                user_prompts = {
+                    key: (value.replace(placeholder, instance_prompt) if isinstance(value, str) else value)
+                    for key, value in user_prompts.items()
+                }
             return user_prompts
         except Exception as e:
             logger.error(f"Could not read user prompt file {user_prompt_path}: {e}")
