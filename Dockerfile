@@ -6,8 +6,8 @@ ARG PYTHON_VERSION=3.11
 # Prevent commands from blocking for input during build
 ENV DEBIAN_FRONTEND=noninteractive
 
-# /workspace is the default volume for Runpod & other hosts
-WORKDIR /workspace
+# /root is the default volume for Prime Intellect hosts
+WORKDIR /root
 
 # Base system dependencies (including Python ${PYTHON_VERSION} toolchain)
 RUN apt-get update -y && \
@@ -41,12 +41,21 @@ RUN apt-get update -y && \
         unzip \
         vim \
         wget \
-        zip && \
+        zip && apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
 # Configure git to support LFS and credential storage
 RUN git config --global credential.helper store && \
     git lfs install
+
+RUN mkdir -p /var/run/sshd && \
+sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config && \
+sed -i 's@session\s*required\s*pam_loginuid.so@session optional pam_loginuid.so@g' /etc/pam.d/sshd && \
+ssh-keygen -A
+
+# Create SSH directory for root
+RUN mkdir -p /root/.ssh && \
+chmod 700 /root/.ssh
 
 # Create a dedicated virtual environment with the requested Python version
 RUN python${PYTHON_VERSION} -m venv /opt/venv && \
@@ -60,7 +69,7 @@ ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
 EXPOSE 22/tcp
 
 # HuggingFace cache location and platform hint for setup.py
-ENV HF_HOME=/workspace/huggingface
+ENV HF_HOME=/root/huggingface
 ENV SIMPLETUNER_PLATFORM=cuda
 
 # Install supporting CLIs ahead of the project install
@@ -70,13 +79,16 @@ RUN pip install --no-cache-dir "huggingface_hub[cli]" wandb
 RUN pip install --no-cache-dir mpi4py
 
 # Install SimpleTuner from PyPI to match published releases
-RUN pip install --no-cache-dir simpletuner
+#RUN pip install --no-cache-dir simpletuner
+COPY . /opt/simpletuner
+RUN pip install --no-cache-dir /opt/simpletuner
 
 # Copy start script with exec permissions
 COPY --chmod=755 docker-start.sh /start.sh
 
+RUN rm -rf /opt/simpletuner/output/*
 # Ensure we remain in the default workspace location
-WORKDIR /workspace
+WORKDIR /root
 
 # Dummy entrypoint
 ENTRYPOINT [ "/start.sh" ]
